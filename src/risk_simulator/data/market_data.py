@@ -8,7 +8,8 @@ software demonstration and must not be interpreted as historical performance.
 from __future__ import annotations
 
 from datetime import date
-from typing import Iterable
+from io import BytesIO
+from typing import BinaryIO, Iterable
 
 import numpy as np
 import pandas as pd
@@ -107,6 +108,45 @@ def generate_synthetic_demo_prices(
     return validate_market_prices(pd.DataFrame(values, index=dates, columns=selected))
 
 
+def load_uploaded_prices_csv(uploaded_file: BinaryIO) -> pd.DataFrame:
+    """Load daily prices from a user-provided CSV with a date column and ticker columns."""
+    try:
+        raw_bytes = (
+            uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+        )
+        raw = pd.read_csv(BytesIO(raw_bytes))
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError) as exc:
+        raise ValueError("Could not read this file as a comma-separated prices CSV.") from exc
+
+    if raw.empty or len(raw.columns) < 2:
+        raise ValueError("CSV must contain a date column and at least one price column.")
+    date_column = next(
+        (
+            column
+            for column in raw.columns
+            if str(column).strip().lower() in {"date", "datetime", "timestamp"}
+        ),
+        None,
+    )
+    if date_column is None and str(raw.columns[0]).startswith("Unnamed:"):
+        date_column = raw.columns[0]
+    if date_column is None:
+        raise ValueError(
+            "CSV needs a Date, Datetime, or Timestamp column (or a date index in the first column)."
+        )
+
+    parsed_dates = pd.to_datetime(raw[date_column], errors="coerce", utc=True)
+    if parsed_dates.isna().any():
+        raise ValueError("The CSV date column contains invalid or missing dates.")
+    prices = raw.drop(columns=[date_column]).copy()
+    prices.columns = [str(column).strip().upper() for column in prices.columns]
+    if any(not column or column.startswith("UNNAMED:") for column in prices.columns):
+        raise ValueError("Each price column must have a ticker or instrument name.")
+    prices.index = pd.DatetimeIndex(parsed_dates.dt.tz_localize(None))
+    prices.index.name = "date"
+    return validate_market_prices(prices)
+
+
 def fetch_yahoo_prices(
     tickers: Iterable[str],
     start: date | str | pd.Timestamp,
@@ -126,7 +166,7 @@ def fetch_yahoo_prices(
     return _cached_yahoo_download(
         selected,
         start_ts.strftime("%Y-%m-%d"),
-        (end_ts + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+        (end_ts + pd.Timedelta(1, unit="D")).strftime("%Y-%m-%d"),
     ).copy()
 
 
@@ -138,7 +178,8 @@ def _cached_yahoo_download(
         import yfinance as yf
     except ImportError as exc:
         raise RuntimeError(
-            "Yahoo Finance mode requires yfinance. Install the requirements.txt dependencies."
+            'Yahoo Finance mode requires the optional dependency; install with "pip install -e '
+            '.[research]".'
         ) from exc
     try:
         raw = yf.download(

@@ -15,7 +15,11 @@ def _covariance_array(
     *,
     require_positive_definite: bool = False,
 ) -> np.ndarray:
-    matrix = covariance.to_numpy(dtype=float) if isinstance(covariance, pd.DataFrame) else np.asarray(covariance, dtype=float)
+    matrix = (
+        covariance.to_numpy(dtype=float)
+        if isinstance(covariance, pd.DataFrame)
+        else np.asarray(covariance, dtype=float)
+    )
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1] or matrix.shape[0] == 0:
         raise ValueError("Covariance must be a non-empty square matrix.")
     if not np.isfinite(matrix).all():

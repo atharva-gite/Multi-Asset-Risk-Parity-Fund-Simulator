@@ -89,7 +89,8 @@ def solve_erc_weights(
         return OptimizationResult(
             False,
             None,
-            f"ERC solution did not converge within tolerance (risk-share deviation {deviation:.6g}).",
+            f"ERC solution did not converge within tolerance "
+            f"(risk-share deviation {deviation:.6g}).",
             deviation,
         )
     return OptimizationResult(True, weights, "ERC optimization converged.", deviation)

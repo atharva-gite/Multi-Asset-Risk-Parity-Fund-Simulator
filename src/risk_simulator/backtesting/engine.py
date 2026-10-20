@@ -114,7 +114,9 @@ def run_erc_backtest(
                 )
             base_vol = portfolio_volatility(optimized.weights, covariance)
             if base_vol <= 0:
-                raise RuntimeError(f"ERC rebalance on {date_value.date()} has zero estimated volatility.")
+                raise RuntimeError(
+                    f"ERC rebalance on {date_value.date()} has zero estimated volatility."
+                )
             leverage = min(target_annual_volatility / base_vol, max_leverage)
             new_exposure = optimized.weights * leverage
             turnover = (
@@ -187,7 +189,11 @@ def run_fixed_weight_backtest(
         turnover = 0.0
         cost = 0.0
         if period_value != previous_period:
-            turnover = float(np.abs(target).sum()) if current is None else float(np.abs(target - current).sum())
+            turnover = (
+                float(np.abs(target).sum())
+                if current is None
+                else float(np.abs(target - current).sum())
+            )
             cost = turnover * transaction_cost_bps / 10_000.0
             current = target.copy()
         previous_period = period_value

@@ -53,9 +53,7 @@ class RiskCalculationTests(unittest.TestCase):
         )
 
     def test_covariance_annualization_and_complete_rows(self) -> None:
-        returns = pd.DataFrame(
-            {"A": [0.01, 0.02, np.nan, -0.01], "B": [0.0, 0.01, 0.03, -0.02]}
-        )
+        returns = pd.DataFrame({"A": [0.01, 0.02, np.nan, -0.01], "B": [0.0, 0.01, 0.03, -0.02]})
         covariance = estimate_covariance(returns, periods_per_year=10, min_observations=3)
         complete_covariance = returns.dropna().cov(ddof=1) * 10
         pd.testing.assert_frame_equal(covariance, complete_covariance)

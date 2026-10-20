@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from risk_simulator.backtesting.engine import run_erc_backtest, run_fixed_weight_backtest
 from risk_simulator.data.market_data import (
+    fetch_yahoo_prices,
     generate_synthetic_demo_prices,
     validate_market_prices,
 )
@@ -48,6 +50,30 @@ class MarketDataTests(unittest.TestCase):
         second = generate_synthetic_demo_prices("2024-01-01", "2024-02-01", ["SPY", "IEF"])
         pd.testing.assert_frame_equal(first, second)
         self.assertEqual(list(first.columns), ["SPY", "IEF"])
+
+    def test_yahoo_adapter_selects_close_and_caches_response(self) -> None:
+        from risk_simulator.data.market_data import _cached_yahoo_download
+
+        _cached_yahoo_download.clear()
+        index = pd.to_datetime(["2024-01-02", "2024-01-03"])
+        columns = pd.MultiIndex.from_tuples(
+            [("Close", "SPY"), ("Close", "IEF"), ("Open", "SPY"), ("Open", "IEF")]
+        )
+        raw = pd.DataFrame(
+            [[100.0, 90.0, 99.0, 89.0], [101.0, 91.0, 100.0, 90.0]],
+            index=index,
+            columns=columns,
+        )
+        with patch("yfinance.download", return_value=raw) as download:
+            first = fetch_yahoo_prices(["SPY", "IEF"], "2024-01-01", "2024-01-03")
+            second = fetch_yahoo_prices(["SPY", "IEF"], "2024-01-01", "2024-01-03")
+
+        self.assertEqual(list(first.columns), ["SPY", "IEF"])
+        self.assertEqual(first.iloc[0].to_list(), [100.0, 90.0])
+        pd.testing.assert_frame_equal(first, second)
+        download.assert_called_once()
+        self.assertEqual(download.call_args.kwargs["end"], "2024-01-04")
+        _cached_yahoo_download.clear()
 
 
 class BacktestTests(unittest.TestCase):

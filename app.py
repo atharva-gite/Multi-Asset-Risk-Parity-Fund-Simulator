@@ -10,6 +10,22 @@ import pandas as pd
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _local_yahoo_mode_enabled() -> bool:
+    """Read the local-only Yahoo opt-in without consulting hosted environment settings."""
+    try:
+        lines = (ROOT / ".env").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        setting, separator, value = line.partition("=")
+        if separator and setting.strip() == "ENABLE_LOCAL_YAHOO_MODE":
+            return value.strip().strip("\"'").lower() in {"1", "true", "yes"}
+    return False
+
+
+LOCAL_YAHOO_MODE_ENABLED = _local_yahoo_mode_enabled()
 sys.path.insert(0, str(ROOT / "src"))
 
 from risk_simulator.backtesting.engine import run_erc_backtest, run_fixed_weight_backtest
@@ -22,7 +38,12 @@ from risk_simulator.config import (
     DEFAULT_TARGET_VOLATILITY,
     DEFAULT_TRANSACTION_COST_BPS,
 )
-from risk_simulator.data.market_data import fetch_yahoo_prices, generate_synthetic_demo_prices
+from risk_simulator.data.market_data import (
+    fetch_yahoo_prices,
+    generate_synthetic_demo_prices,
+    load_uploaded_prices_csv,
+    validate_market_prices,
+)
 from risk_simulator.portfolio.optimization import solve_erc_weights
 from risk_simulator.portfolio.returns import prices_to_returns
 from risk_simulator.portfolio.risk import (
@@ -30,6 +51,7 @@ from risk_simulator.portfolio.risk import (
     portfolio_volatility,
     risk_contributions,
 )
+from risk_simulator.reporting import build_run_manifest, manifest_json
 from risk_simulator.visualization.charts import cumulative_returns, drawdown_series
 
 st.set_page_config(
@@ -41,7 +63,7 @@ st.set_page_config(
 st.title("Multi-Asset Risk Parity Fund Simulator")
 st.caption(
     "An open research scaffold for long-only equal-risk-contribution portfolios, "
-    "volatility targeting, and a transparent 60/40 comparison."
+    "volatility targeting, and a transparent 60/40 comparison using daily data."
 )
 st.info(
     "Research demonstration only. It does not reproduce Bridgewater's proprietary "
@@ -50,24 +72,65 @@ st.info(
 )
 
 today = date.today()
+uploaded_prices = None
 with st.sidebar:
     st.header("Simulation settings")
+    data_modes = ["Synthetic demonstration", "User-uploaded licensed CSV"]
+    if LOCAL_YAHOO_MODE_ENABLED:
+        data_modes.append("Yahoo Finance (local research only)")
     mode = st.radio(
         "Data mode",
-        ("Synthetic demonstration", "Yahoo Finance"),
-        help="Synthetic data is deterministic and clearly labeled. Yahoo Finance requires internet access.",
+        data_modes,
+        help=(
+            "Synthetic data works offline. Upload a licensed daily-price CSV, or enable "
+            "Yahoo mode only in a private local research environment."
+        ),
     )
+    if mode == "User-uploaded licensed CSV":
+        csv_template = pd.DataFrame(columns=["Date", *ASSET_UNIVERSE]).to_csv(index=False)
+        st.download_button(
+            "Download CSV template",
+            data=csv_template,
+            file_name="daily-prices-template.csv",
+            mime="text/csv",
+            key="download_prices_template",
+        )
+        uploaded_file = st.file_uploader(
+            "Daily prices CSV",
+            type=["csv"],
+            help=(
+                "Use a Date column followed by one adjusted-close price column per ticker. "
+                "Include enough pre-evaluation history for the covariance lookback. "
+                "The app does not adjust uploaded prices or write the file to disk."
+            ),
+        )
+        if uploaded_file is not None:
+            try:
+                uploaded_prices = load_uploaded_prices_csv(uploaded_file)
+            except ValueError as exc:
+                st.error(f"Could not load uploaded prices: {exc}")
+        else:
+            st.caption("Upload a CSV with daily prices to select its instruments.")
     selected_dates = st.date_input(
         "Evaluation date range",
         value=(today - timedelta(days=365 * 5), today),
         min_value=date(1990, 1, 1),
         max_value=today,
     )
+    ticker_options = (
+        list(uploaded_prices.columns)
+        if mode == "User-uploaded licensed CSV" and uploaded_prices is not None
+        else list(ASSET_UNIVERSE)
+        if mode != "User-uploaded licensed CSV"
+        else []
+    )
     tickers = st.multiselect(
         "Asset universe",
-        options=list(ASSET_UNIVERSE),
-        default=list(ASSET_UNIVERSE),
-        format_func=lambda ticker: f"{ticker} — {ASSET_UNIVERSE[ticker]}",
+        options=ticker_options,
+        default=ticker_options,
+        format_func=lambda ticker: (
+            f"{ticker} — {ASSET_UNIVERSE.get(ticker, 'Uploaded instrument')}"
+        ),
     )
     lookback = st.slider("Covariance lookback (trading days)", 20, 252, DEFAULT_LOOKBACK_DAYS, 1)
     rebalance_frequency = st.selectbox(
@@ -93,6 +156,11 @@ if mode == "Synthetic demonstration":
         "SYNTHETIC DEMONSTRATION DATA — all prices and performance curves below are "
         "generated for interface testing and are not historical observations."
     )
+elif mode == "Yahoo Finance (local research only)":
+    st.warning(
+        "LOCAL RESEARCH MODE — Yahoo Finance data is enabled by a local .env setting. "
+        "This mode is hidden by default and must not be enabled on the public deployment."
+    )
 
 if isinstance(selected_dates, (tuple, list)) and len(selected_dates) == 2:
     start_date, end_date = selected_dates
@@ -103,6 +171,9 @@ if start_date >= end_date:
     st.error("The start date must be earlier than the end date.")
     st.stop()
 if not tickers:
+    if mode == "User-uploaded licensed CSV" and uploaded_prices is None:
+        st.info("Upload a daily prices CSV in the sidebar to continue.")
+        st.stop()
     st.warning("Select at least one asset to run the simulator.")
     st.stop()
 
@@ -115,12 +186,22 @@ with st.spinner("Loading prices and calculating the portfolio..."):
         if mode == "Synthetic demonstration":
             prices = generate_synthetic_demo_prices(fetch_start, end_date, tickers)
             mode_label = "Synthetic demonstration (not historical)"
-        else:
+        elif mode == "Yahoo Finance (local research only)":
             prices = fetch_yahoo_prices(tickers, fetch_start, end_date)
-            mode_label = "Yahoo Finance auto-adjusted daily closes"
+            mode_label = "Yahoo Finance auto-adjusted daily closes (local research)"
+        else:
+            assert uploaded_prices is not None
+            selected_prices = uploaded_prices.loc[
+                uploaded_prices.index <= pd.Timestamp(end_date), list(tickers)
+            ]
+            prices = validate_market_prices(selected_prices)
+            mode_label = "User-uploaded licensed daily prices"
     except (RuntimeError, ValueError, ImportError) as exc:
         st.error(f"Price retrieval failed: {exc}")
-        st.info("Select Synthetic demonstration in the sidebar to continue without network access.")
+        st.info(
+            "Select Synthetic demonstration or upload licensed CSV prices to continue "
+            "without a network data source."
+        )
         st.stop()
 
 returns = prices_to_returns(prices, method="simple")
@@ -131,11 +212,18 @@ complete_returns = returns.dropna(how="any")
 evaluation_rows = complete_returns.loc[complete_returns.index >= evaluation_start]
 
 st.subheader("Data status")
-status_columns = st.columns(4)
+status_columns = st.columns(5)
 status_columns[0].metric("Selected mode", mode_label)
-status_columns[1].metric("Price coverage", f"{prices.index.min().date()} to {prices.index.max().date()}")
-status_columns[2].metric("Complete daily returns", f"{len(complete_returns):,}")
-status_columns[3].metric("Evaluation observations", f"{len(evaluation_rows):,}")
+status_columns[1].metric("Latest price observation", prices.index.max().date().isoformat())
+status_columns[2].metric(
+    "Price history", f"{prices.index.min().date()} to {prices.index.max().date()}"
+)
+status_columns[3].metric("Complete daily returns", f"{len(complete_returns):,}")
+status_columns[4].metric("Evaluation observations", f"{len(evaluation_rows):,}")
+st.caption(
+    f"Requested evaluation period: {start_date} to {end_date}. Available prices run through "
+    f"{prices.index.max().date()}; results use observed data only."
+)
 missing_cells = int(prices.isna().sum().sum())
 if missing_cells:
     st.caption(
@@ -144,6 +232,11 @@ if missing_cells:
     )
 else:
     st.caption("No missing price cells were found in the loaded table.")
+if mode == "User-uploaded licensed CSV":
+    st.caption(
+        "Uploaded price files are processed for this app session and are not written to disk. "
+        "The user who uploads the data is responsible for having display and use rights."
+    )
 
 window = complete_returns.loc[complete_returns.index <= selected_end].tail(lookback)
 if len(window) < lookback:
@@ -152,6 +245,10 @@ if len(window) < lookback:
         f"found {len(window)}. Expand the date range or reduce the lookback."
     )
     st.stop()
+st.caption(
+    f"Latest-data allocation snapshot: covariance uses the most recent {len(window)} "
+    f"complete return observations through {window.index.max().date()}."
+)
 try:
     covariance = estimate_covariance(window, min_observations=lookback)
     optimization = solve_erc_weights(covariance)
@@ -170,7 +267,7 @@ target_exposures = base_weights * current_leverage
 targeted_volatility = portfolio_volatility(target_exposures, covariance)
 contributions = risk_contributions(target_exposures, covariance)
 
-st.subheader("Current allocation and risk")
+st.subheader("Latest-data allocation and risk")
 metric_columns = st.columns(4)
 metric_columns[0].metric("ERC sleeve volatility", f"{base_volatility:.1%}")
 metric_columns[1].metric("Targeted ex-ante volatility", f"{targeted_volatility:.1%}")
@@ -187,9 +284,7 @@ with left:
     st.bar_chart(exposure_table[["target exposure"]])
 with right:
     st.markdown("**Risk contributions**")
-    contribution_table = contributions[
-        ["risk_contribution", "risk_contribution_pct"]
-    ].copy()
+    contribution_table = contributions[["risk_contribution", "risk_contribution_pct"]].copy()
     st.dataframe(
         contribution_table.style.format(
             {"risk_contribution": "{:.2%}", "risk_contribution_pct": "{:.1%}"}
@@ -223,6 +318,7 @@ except (RuntimeError, ValueError) as exc:
     strategy = None
 
 if strategy is not None:
+    benchmark_export_returns = None
     if all(ticker in returns.columns for ticker in BENCHMARK_WEIGHTS):
         try:
             benchmark = run_fixed_weight_backtest(
@@ -232,9 +328,14 @@ if strategy is not None:
                 transaction_cost_bps=transaction_cost_bps,
                 evaluation_start=evaluation_start,
             )
-            benchmark_returns = benchmark.results["net_return"].reindex(strategy.results.index).dropna()
+            benchmark_returns = (
+                benchmark.results["net_return"].reindex(strategy.results.index).dropna()
+            )
             if benchmark_returns.empty:
                 raise ValueError("No overlapping 60/40 benchmark observations are available.")
+            benchmark_export_returns = benchmark.results["net_return"].rename(
+                "benchmark_60_40_net_return"
+            )
             strategy_returns = strategy.results["net_return"].reindex(benchmark_returns.index)
             curves = cumulative_returns(
                 {"ERC strategy": strategy_returns, "60/40 benchmark": benchmark_returns}
@@ -281,8 +382,56 @@ if strategy is not None:
     else:
         st.warning("60/40 comparison unavailable: select both SPY and IEF in the asset universe.")
 
+    export_frame = strategy.results.add_prefix("erc_").join(
+        strategy.weights.add_prefix("erc_exposure_")
+    )
+    if benchmark_export_returns is not None:
+        export_frame = export_frame.join(
+            benchmark_export_returns.reindex(export_frame.index), how="left"
+        )
+    export_frame.index.name = "date"
+    csv_data = export_frame.to_csv(
+        date_format="%Y-%m-%d",
+        float_format="%.10g",
+        lineterminator="\n",
+    )
+    manifest = build_run_manifest(
+        prices,
+        data_source=mode_label,
+        evaluation_start=evaluation_start,
+        evaluation_end=selected_end,
+        tickers=tickers,
+        lookback=lookback,
+        rebalance_frequency=rebalance_frequency,
+        target_annual_volatility=target_volatility,
+        max_leverage=max_leverage,
+        transaction_cost_bps=transaction_cost_bps,
+        benchmark_weights=BENCHMARK_WEIGHTS if benchmark_export_returns is not None else None,
+    )
+    with st.expander("Export run artifacts"):
+        st.caption(
+            "The manifest records the price-table fingerprint and selected assumptions. "
+            "The CSV contains daily ERC returns, exposures, turnover, costs, and the "
+            "60/40 net return when that comparison is available."
+        )
+        download_columns = st.columns(2)
+        download_columns[0].download_button(
+            "Download backtest CSV",
+            data=csv_data,
+            file_name="risk-parity-backtest.csv",
+            mime="text/csv",
+            key="download_backtest_csv",
+        )
+        download_columns[1].download_button(
+            "Download run manifest",
+            data=manifest_json(manifest),
+            file_name="risk-parity-run-manifest.json",
+            mime="application/json",
+            key="download_run_manifest",
+        )
+
 st.caption(
-    "Yahoo Finance availability and adjusted-price history can change. This prototype "
-    "does not include FRED data, taxes, financing costs, liquidity constraints, or "
-    "production-grade execution assumptions."
+    "This is a daily-frequency research application with no live quotes or order routing. "
+    "Uploaded prices are used as provided. The simulator does not include financing costs, "
+    "taxes, liquidity constraints, or production-grade execution assumptions."
 )
